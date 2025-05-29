@@ -10,9 +10,11 @@ This is a Go project that demonstrates how to test SFTP functionality using Dock
 
 1. SFTP client implementation with upload functionality
 2. Docker container management using `ory/dockertest/v3`
-3. Automated testing with atmoz/sftp Docker image
-4. GitHub Actions CI/CD pipeline
-5. Cross-platform compatibility (tested on macOS, works in GitHub Actions Ubuntu)
+3. **Dynamic port allocation** - automatically finds available ports to avoid conflicts
+4. Automated testing with atmoz/sftp Docker image
+5. **Parallel test support** - multiple tests can run concurrently safely
+6. GitHub Actions CI/CD pipeline
+7. Cross-platform compatibility (tested on macOS, works in GitHub Actions Ubuntu)
 
 ## Development Commands
 
@@ -35,10 +37,26 @@ This is a Go project that demonstrates how to test SFTP functionality using Dock
 
 The project uses `dockertest` instead of direct `exec.Command("docker", ...)` calls for better CI/CD compatibility:
 
+- **Dynamic port allocation**: Uses `findAvailablePort()` to automatically find free ports
+- **Parallel test safety**: Each test gets its own unique port to avoid conflicts
+- **Port range support**: `findAvailablePortInRange()` for constrained environments
 - Automatically pulls and manages Docker containers
 - Handles port mapping and container lifecycle
 - Provides retry mechanisms for service readiness
 - Works seamlessly in GitHub Actions and other CI environments
+
+### Port Allocation Methods
+
+```go
+// Find any available port (recommended)
+port, err := findAvailablePort()
+
+// Find port in specific range
+port, err := findAvailablePortInRange(8000, 9000)
+
+// Check if specific port is available
+available := isPortAvailable(2222)
+```
 
 ## CI/CD
 
