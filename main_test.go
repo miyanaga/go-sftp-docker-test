@@ -2,40 +2,74 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/ory/dockertest/v3"
+	"github.com/ory/dockertest/v3/docker"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const (
-	sftpImage     = "atmoz/sftp:latest"
-	containerName = "sftp-test-container"
-	sftpPort      = "2222"
-	username      = "testuser"
-	password      = "testpass"
+	sftpImage = "atmoz/sftp:latest"
+	username  = "testuser"
+	password  = "testpass"
 )
 
 func TestSFTPUpload(t *testing.T) {
-	// Setup SFTP container using Docker CLI
-	containerID := setupSFTPContainer(t)
-	defer cleanupContainer(t, containerID)
+	// Setup dockertest pool
+	pool, err := dockertest.NewPool("")
+	require.NoError(t, err)
 
+	// Test that we can connect to docker
+	err = pool.Client.Ping()
+	require.NoError(t, err)
+
+	// Pull and start SFTP container
+	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
+		Repository: "atmoz/sftp",
+		Tag:        "latest",
+		Cmd:        []string{fmt.Sprintf("%s:%s:1001", username, password)},
+		ExposedPorts: []string{"22/tcp"},
+	}, func(config *docker.HostConfig) {
+		config.AutoRemove = true
+		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
+	})
+	require.NoError(t, err)
+	defer func() {
+		if err := pool.Purge(resource); err != nil {
+			log.Printf("Could not purge resource: %s", err)
+		}
+	}()
+
+	// Get the mapped port
+	hostPort := resource.GetPort("22/tcp")
+	
 	// Wait for SFTP service to be ready
-	time.Sleep(10 * time.Second)
+	pool.MaxWait = 120 * time.Second
+	err = pool.Retry(func() error {
+		client := NewSFTPClient("localhost", hostPort, username, password)
+		return client.Connect()
+	})
+	require.NoError(t, err)
+
+	// Create upload directory and set proper permissions
+	_, err = resource.Exec([]string{"mkdir", "-p", "/home/testuser/upload"}, dockertest.ExecOptions{})
+	require.NoError(t, err)
+	_, err = resource.Exec([]string{"chown", "testuser:users", "/home/testuser/upload"}, dockertest.ExecOptions{})
+	require.NoError(t, err)
 
 	// Create test file
 	tempFile := createTempTestFile(t)
 	defer os.Remove(tempFile)
 
 	// Test SFTP upload
-	sftpClient := NewSFTPClient("localhost", sftpPort, username, password)
-	err := sftpClient.Connect()
+	sftpClient := NewSFTPClient("localhost", hostPort, username, password)
+	err = sftpClient.Connect()
 	require.NoError(t, err)
 	defer sftpClient.Close()
 
@@ -44,62 +78,9 @@ func TestSFTPUpload(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Verify file exists in container
-	verifyFileUpload(t, containerID, remoteFilePath)
+	verifyFileUpload(t, resource, remoteFilePath)
 }
 
-func setupSFTPContainer(t *testing.T) string {
-	// Pull image if not exists
-	cmd := exec.Command("docker", "image", "inspect", sftpImage)
-	if err := cmd.Run(); err != nil {
-		t.Logf("Pulling atmoz/sftp image...")
-		cmd = exec.Command("docker", "pull", sftpImage)
-		require.NoError(t, cmd.Run())
-	}
-
-	// Remove existing container if exists
-	exec.Command("docker", "rm", "-f", containerName).Run()
-
-	// Start atmoz/sftp container with user configuration
-	cmd = exec.Command("docker", "run", "-d",
-		"--name", containerName,
-		"-p", fmt.Sprintf("%s:22", sftpPort),
-		sftpImage,
-		fmt.Sprintf("%s:%s:1001", username, password))
-
-	output, err := cmd.Output()
-	require.NoError(t, err)
-
-	containerID := strings.TrimSpace(string(output))
-	t.Logf("Started atmoz/sftp container: %s", containerID)
-
-	// Check container logs and directory structure for debugging
-	time.Sleep(2 * time.Second)
-	logCmd := exec.Command("docker", "logs", containerID)
-	if logs, err := logCmd.Output(); err == nil {
-		t.Logf("Container logs: %s", string(logs))
-	}
-
-	// Check directory structure and create upload directory
-	lsCmd := exec.Command("docker", "exec", containerID, "ls", "-la", "/home/testuser/")
-	if lsOutput, err := lsCmd.Output(); err == nil {
-		t.Logf("User home directory: %s", string(lsOutput))
-	}
-
-	// Create upload directory and set proper permissions
-	mkdirCmd := exec.Command("docker", "exec", containerID, "mkdir", "-p", "/home/testuser/upload")
-	mkdirCmd.Run()
-	chownCmd := exec.Command("docker", "exec", containerID, "chown", "testuser:users", "/home/testuser/upload")
-	chownCmd.Run()
-
-	return containerID
-}
-
-func cleanupContainer(t *testing.T, containerID string) {
-	cmd := exec.Command("docker", "rm", "-f", containerID)
-	if err := cmd.Run(); err != nil {
-		t.Logf("Warning: failed to remove container: %v", err)
-	}
-}
 
 func createTempTestFile(t *testing.T) string {
 	tempDir := t.TempDir()
@@ -112,17 +93,17 @@ func createTempTestFile(t *testing.T) string {
 	return tempFile
 }
 
-func verifyFileUpload(t *testing.T, containerID, remoteFilePath string) {
+func verifyFileUpload(t *testing.T, resource *dockertest.Resource, remoteFilePath string) {
 	// Execute a command to check if the file exists in the container
 	fullPath := fmt.Sprintf("/home/testuser/%s", remoteFilePath)
-	cmd := exec.Command("docker", "exec", containerID, "test", "-f", fullPath)
-	err := cmd.Run()
-	if err != nil {
+	exitCode, err := resource.Exec([]string{"test", "-f", fullPath}, dockertest.ExecOptions{})
+	if err != nil || exitCode != 0 {
 		// Try to list the directory contents for debugging
-		lsCmd := exec.Command("docker", "exec", containerID, "ls", "-la", "/home/testuser/upload/")
-		if lsOutput, lsErr := lsCmd.Output(); lsErr == nil {
-			t.Logf("Upload directory contents: %s", string(lsOutput))
+		_, lsErr := resource.Exec([]string{"ls", "-la", "/home/testuser/upload/"}, dockertest.ExecOptions{})
+		if lsErr == nil {
+			t.Logf("Listed upload directory for debugging")
 		}
 	}
-	assert.NoError(t, err, "File should exist on the SFTP server")
+	assert.Equal(t, 0, exitCode, "File should exist on the SFTP server")
+	assert.NoError(t, err, "Exec command should succeed")
 }
