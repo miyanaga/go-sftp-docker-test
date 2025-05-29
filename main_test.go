@@ -31,9 +31,9 @@ func TestSFTPUpload(t *testing.T) {
 
 	// Pull and start SFTP container
 	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: "atmoz/sftp",
-		Tag:        "latest",
-		Cmd:        []string{fmt.Sprintf("%s:%s:1001", username, password)},
+		Repository:   "atmoz/sftp",
+		Tag:          "latest",
+		Cmd:          []string{fmt.Sprintf("%s:%s:1001", username, password)},
 		ExposedPorts: []string{"22/tcp"},
 	}, func(config *docker.HostConfig) {
 		config.AutoRemove = true
@@ -48,7 +48,7 @@ func TestSFTPUpload(t *testing.T) {
 
 	// Get the mapped port
 	hostPort := resource.GetPort("22/tcp")
-	
+
 	// Wait for SFTP service to be ready
 	pool.MaxWait = 120 * time.Second
 	err = pool.Retry(func() error {
@@ -80,7 +80,6 @@ func TestSFTPUpload(t *testing.T) {
 	// Verify file exists in container
 	verifyFileUpload(t, resource, remoteFilePath)
 }
-
 
 func createTempTestFile(t *testing.T) string {
 	tempDir := t.TempDir()
