@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,31 +92,77 @@ func TestSFTPUpload(t *testing.T) {
 	verifyFileUpload(t, resource, remoteFilePath)
 }
 
+type AuthTestCase struct {
+	name       string
+	authType   string
+	privateKey string
+	passphrase string
+	dockerCmd  []string
+	mounts     []string
+	fileName   string
+	port       int
+}
+
 func TestSFTPAuthenticationMethods(t *testing.T) {
-	t.Run("PasswordAuth", func(t *testing.T) {
-		t.Parallel()
-		testSFTPPasswordAuth(t)
-	})
+	testCases := []AuthTestCase{}
 
-	t.Run("RSAKeyAuth", func(t *testing.T) {
-		t.Parallel()
-		testSFTPRSAKeyAuth(t)
-	})
+	// Assign available ports to each test case
+	baseTestCases := []AuthTestCase{
+		{
+			name:      "PasswordAuth",
+			authType:  "password",
+			dockerCmd: []string{fmt.Sprintf("%s:%s:1001", username, password)},
+			fileName:  "password-auth-test.txt",
+		},
+		{
+			name:       "RSAKeyAuth",
+			authType:   "privatekey",
+			privateKey: "keys/id_rsa_without_passphrase",
+			dockerCmd:  []string{fmt.Sprintf("%s::1001", username)},
+			fileName:   "rsa-key-auth-test.txt",
+		},
+		{
+			name:       "RSAKeyWithPassphraseAuth",
+			authType:   "privatekey_passphrase",
+			privateKey: "keys/id_rsa_with_passphrase",
+			passphrase: "the-pass",
+			dockerCmd:  []string{fmt.Sprintf("%s::1001", username)},
+			fileName:   "rsa-key-passphrase-auth-test.txt",
+		},
+		{
+			name:       "ED25519KeyAuth",
+			authType:   "privatekey",
+			privateKey: "keys/id_ed25519_without_passphrase",
+			dockerCmd:  []string{fmt.Sprintf("%s::1001", username)},
+			fileName:   "ed25519-key-auth-test.txt",
+		},
+		{
+			name:       "ED25519KeyWithPassphraseAuth",
+			authType:   "privatekey_passphrase",
+			privateKey: "keys/id_ed25519_with_passphrase",
+			passphrase: "the-pass",
+			dockerCmd:  []string{fmt.Sprintf("%s::1001", username)},
+			fileName:   "ed25519-key-passphrase-auth-test.txt",
+		},
+	}
 
-	t.Run("RSAKeyWithPassphraseAuth", func(t *testing.T) {
-		t.Parallel()
-		testSFTPRSAKeyWithPassphraseAuth(t)
-	})
+	// Assign ports to test cases with some spacing to avoid conflicts
+	basePort, err := findAvailablePort()
+	require.NoError(t, err)
 
-	t.Run("ED25519KeyAuth", func(t *testing.T) {
-		t.Parallel()
-		testSFTPED25519KeyAuth(t)
-	})
+	for i, baseTC := range baseTestCases {
+		tc := baseTC
+		tc.port = basePort + i + 1 // Add spacing between ports
+		testCases = append(testCases, tc)
+	}
 
-	t.Run("ED25519KeyWithPassphraseAuth", func(t *testing.T) {
-		t.Parallel()
-		testSFTPED25519KeyWithPassphraseAuth(t)
-	})
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			testSFTPAuth(t, tc)
+		})
+	}
 }
 
 func TestSFTPUploadMultiple(t *testing.T) {
@@ -267,25 +314,35 @@ func verifyFileUpload(t *testing.T, resource *dockertest.Resource, remoteFilePat
 	assert.NoError(t, err, "Exec command should succeed")
 }
 
-func testSFTPPasswordAuth(t *testing.T) {
-	availablePort, err := findAvailablePort()
-	require.NoError(t, err)
-	t.Logf("Using port: %d for password auth", availablePort)
+func testSFTPAuth(t *testing.T, tc AuthTestCase) {
+	t.Logf("Using port: %d for %s", tc.port, tc.name)
 
 	pool, err := dockertest.NewPool("")
 	require.NoError(t, err)
 	err = pool.Client.Ping()
 	require.NoError(t, err)
 
-	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
+	// Setup mounts for public key authentication
+	var mounts []string
+	if tc.authType == "privatekey" || tc.authType == "privatekey_passphrase" {
+		mounts = setupPublicKeyMounts(t, tc.privateKey)
+		defer cleanupPublicKeyMounts(mounts)
+	}
+
+	runOptions := &dockertest.RunOptions{
 		Repository:   "atmoz/sftp",
 		Tag:          "latest",
-		Cmd:          []string{fmt.Sprintf("%s:%s:1001", username, password)},
+		Cmd:          tc.dockerCmd,
 		ExposedPorts: []string{"22/tcp"},
 		PortBindings: map[docker.Port][]docker.PortBinding{
-			"22/tcp": {{HostIP: "0.0.0.0", HostPort: strconv.Itoa(availablePort)}},
+			"22/tcp": {{HostIP: "0.0.0.0", HostPort: strconv.Itoa(tc.port)}},
 		},
-	}, func(config *docker.HostConfig) {
+	}
+	if len(mounts) > 0 {
+		runOptions.Mounts = mounts
+	}
+
+	resource, err := pool.RunWithOptions(runOptions, func(config *docker.HostConfig) {
 		config.AutoRemove = true
 		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
 	})
@@ -296,296 +353,75 @@ func testSFTPPasswordAuth(t *testing.T) {
 		}
 	}()
 
-	hostPort := strconv.Itoa(availablePort)
+	hostPort := strconv.Itoa(tc.port)
 	pool.MaxWait = 120 * time.Second
+
+	// Wait for service to be ready with appropriate client
 	err = pool.Retry(func() error {
-		client := NewSFTPClient("localhost", hostPort, username, password)
+		client := createSFTPClient(tc, "localhost", hostPort)
 		return client.Connect()
 	})
 	require.NoError(t, err)
 
+	// Setup upload directory
 	_, err = resource.Exec([]string{"mkdir", "-p", "/home/testuser/upload"}, dockertest.ExecOptions{})
 	require.NoError(t, err)
 	_, err = resource.Exec([]string{"chown", "testuser:users", "/home/testuser/upload"}, dockertest.ExecOptions{})
 	require.NoError(t, err)
 
-	tempFile := createTempTestFileWithName(t, "password-auth-test.txt")
+	// Create test file
+	tempFile := createTempTestFileWithName(t, tc.fileName)
 	defer os.Remove(tempFile)
 
-	sftpClient := NewSFTPClient("localhost", hostPort, username, password)
+	// Test SFTP upload
+	sftpClient := createSFTPClient(tc, "localhost", hostPort)
 	err = sftpClient.Connect()
 	require.NoError(t, err)
 	defer sftpClient.Close()
 
-	remoteFilePath := "upload/password-auth-test.txt"
+	remoteFilePath := fmt.Sprintf("upload/%s", tc.fileName)
 	err = sftpClient.Upload(tempFile, remoteFilePath)
 	assert.NoError(t, err)
 
 	verifyFileUpload(t, resource, remoteFilePath)
 }
 
-func testSFTPRSAKeyAuth(t *testing.T) {
-	availablePort, err := findAvailablePort()
-	require.NoError(t, err)
-	t.Logf("Using port: %d for RSA key auth", availablePort)
-
-	pool, err := dockertest.NewPool("")
-	require.NoError(t, err)
-	err = pool.Client.Ping()
-	require.NoError(t, err)
-
-	keyPath := "/tmp/id_rsa_without_passphrase.pub"
-	err = os.WriteFile(keyPath, []byte("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDEOB38RnRdExaIL/b1TF60txjB99PeiqGRpA7m+7WUkji6kYUSy7ZFaYrKdKgV5UY2JGz6FvQ5+Jh7LNoLfRAVZuz5xiOmDPwvFq/T4SW70VZAyzGUtgA+5zvYWhc9P38wG6ZZ23xxp7/x4UewIPhbAzc4ti2/zNgVOrmrpvWr1RgyDffbgDt1melR6JUrv5B9vdUt6j56fFTjPUt10gR/4NoVDt24V5oXyz9+H44pjXNDhY1m+NIWOAIikggR0D7YOqlcUBdv5x09ICggedM/Kxhyw8otK7fKjBaeQDx6xLTyELHfBiAlaNU5rtutkXFr1QWvXRBWwwrmMRdTzNikORG2/UgXswXQZ2AL1Js3UAbahM3Z6BJ/hIVEXLOAkVStoxKydAMpjYD3DyOExh5lI50Mj2tw8jrDIbVi+X/bgd8ZK8DRPeoB0kbw09lUpA62lX8JWoAKVAPJ9eTqcBS6+WBXsFzBeFBLiufyALEKphYZX5NTVol+I2j1vjK0CJzpZczchX4HUGJ5HGPEQgbCMY58ektCMbh9xEI9ZTzL4+qwL3P91gC7ZzpfkTwxygumGYHysHT9TYLNRG57l5Vt9TFixgOFF9DHxBmNP1d3Hv8kBxn8CXdpNy8CgEewAvYyXt5s58Dq6UYRQYAmWz02YdTLaWkrBZeOX42Usn/iZQ== miyanaga@m4pro.local"), 0644)
-	require.NoError(t, err)
-	defer os.Remove(keyPath)
-
-	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository:   "atmoz/sftp",
-		Tag:          "latest",
-		Cmd:          []string{fmt.Sprintf("%s::1001", username)},
-		ExposedPorts: []string{"22/tcp"},
-		PortBindings: map[docker.Port][]docker.PortBinding{
-			"22/tcp": {{HostIP: "0.0.0.0", HostPort: strconv.Itoa(availablePort)}},
-		},
-		Mounts: []string{fmt.Sprintf("%s:/home/%s/.ssh/keys/id_rsa.pub:ro", keyPath, username)},
-	}, func(config *docker.HostConfig) {
-		config.AutoRemove = true
-		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
-	})
-	require.NoError(t, err)
-	defer func() {
-		if err := pool.Purge(resource); err != nil {
-			log.Printf("Could not purge resource: %s", err)
-		}
-	}()
-
-	hostPort := strconv.Itoa(availablePort)
-	pool.MaxWait = 120 * time.Second
-
-	privateKeyPath := "keys/id_rsa_without_passphrase"
-	err = pool.Retry(func() error {
-		client := NewSFTPClientWithPrivateKey("localhost", hostPort, username, privateKeyPath)
-		return client.Connect()
-	})
-	require.NoError(t, err)
-
-	_, err = resource.Exec([]string{"mkdir", "-p", "/home/testuser/upload"}, dockertest.ExecOptions{})
-	require.NoError(t, err)
-	_, err = resource.Exec([]string{"chown", "testuser:users", "/home/testuser/upload"}, dockertest.ExecOptions{})
-	require.NoError(t, err)
-
-	tempFile := createTempTestFileWithName(t, "rsa-key-auth-test.txt")
-	defer os.Remove(tempFile)
-
-	sftpClient := NewSFTPClientWithPrivateKey("localhost", hostPort, username, privateKeyPath)
-	err = sftpClient.Connect()
-	require.NoError(t, err)
-	defer sftpClient.Close()
-
-	remoteFilePath := "upload/rsa-key-auth-test.txt"
-	err = sftpClient.Upload(tempFile, remoteFilePath)
-	assert.NoError(t, err)
-
-	verifyFileUpload(t, resource, remoteFilePath)
+func createSFTPClient(tc AuthTestCase, host, port string) *SFTPClient {
+	switch tc.authType {
+	case "password":
+		return NewSFTPClient(host, port, username, password)
+	case "privatekey":
+		return NewSFTPClientWithPrivateKey(host, port, username, tc.privateKey)
+	case "privatekey_passphrase":
+		return NewSFTPClientWithPrivateKeyAndPassphrase(host, port, username, tc.privateKey, tc.passphrase)
+	default:
+		panic(fmt.Sprintf("unsupported auth type: %s", tc.authType))
+	}
 }
 
-func testSFTPRSAKeyWithPassphraseAuth(t *testing.T) {
-	availablePort, err := findAvailablePort()
-	require.NoError(t, err)
-	t.Logf("Using port: %d for RSA key with passphrase auth", availablePort)
-
-	pool, err := dockertest.NewPool("")
-	require.NoError(t, err)
-	err = pool.Client.Ping()
+func setupPublicKeyMounts(t *testing.T, privateKeyPath string) []string {
+	pubKeyPath := privateKeyPath + ".pub"
+	pubKeyContent, err := os.ReadFile(pubKeyPath)
 	require.NoError(t, err)
 
-	keyPath := "/tmp/id_rsa_with_passphrase.pub"
-	pubKeyContent, err := os.ReadFile("keys/id_rsa_with_passphrase.pub")
-	require.NoError(t, err)
-	err = os.WriteFile(keyPath, pubKeyContent, 0644)
-	require.NoError(t, err)
-	defer os.Remove(keyPath)
-
-	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository:   "atmoz/sftp",
-		Tag:          "latest",
-		Cmd:          []string{fmt.Sprintf("%s::1001", username)},
-		ExposedPorts: []string{"22/tcp"},
-		PortBindings: map[docker.Port][]docker.PortBinding{
-			"22/tcp": {{HostIP: "0.0.0.0", HostPort: strconv.Itoa(availablePort)}},
-		},
-		Mounts: []string{fmt.Sprintf("%s:/home/%s/.ssh/keys/id_rsa.pub:ro", keyPath, username)},
-	}, func(config *docker.HostConfig) {
-		config.AutoRemove = true
-		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
-	})
-	require.NoError(t, err)
-	defer func() {
-		if err := pool.Purge(resource); err != nil {
-			log.Printf("Could not purge resource: %s", err)
-		}
-	}()
-
-	hostPort := strconv.Itoa(availablePort)
-	pool.MaxWait = 120 * time.Second
-
-	privateKeyPath := "keys/id_rsa_with_passphrase"
-	passphrase := "the-pass"
-	err = pool.Retry(func() error {
-		client := NewSFTPClientWithPrivateKeyAndPassphrase("localhost", hostPort, username, privateKeyPath, passphrase)
-		return client.Connect()
-	})
+	tempPubKeyPath := filepath.Join(os.TempDir(), fmt.Sprintf("pubkey_%d.pub", time.Now().UnixNano()))
+	err = os.WriteFile(tempPubKeyPath, pubKeyContent, 0644)
 	require.NoError(t, err)
 
-	_, err = resource.Exec([]string{"mkdir", "-p", "/home/testuser/upload"}, dockertest.ExecOptions{})
-	require.NoError(t, err)
-	_, err = resource.Exec([]string{"chown", "testuser:users", "/home/testuser/upload"}, dockertest.ExecOptions{})
-	require.NoError(t, err)
+	// Determine key type for mount path
+	keyType := "id_rsa"
+	if strings.Contains(privateKeyPath, "ed25519") {
+		keyType = "id_ed25519"
+	}
 
-	tempFile := createTempTestFileWithName(t, "rsa-key-passphrase-auth-test.txt")
-	defer os.Remove(tempFile)
-
-	sftpClient := NewSFTPClientWithPrivateKeyAndPassphrase("localhost", hostPort, username, privateKeyPath, passphrase)
-	err = sftpClient.Connect()
-	require.NoError(t, err)
-	defer sftpClient.Close()
-
-	remoteFilePath := "upload/rsa-key-passphrase-auth-test.txt"
-	err = sftpClient.Upload(tempFile, remoteFilePath)
-	assert.NoError(t, err)
-
-	verifyFileUpload(t, resource, remoteFilePath)
+	return []string{fmt.Sprintf("%s:/home/%s/.ssh/keys/%s.pub:ro", tempPubKeyPath, username, keyType)}
 }
 
-func testSFTPED25519KeyAuth(t *testing.T) {
-	availablePort, err := findAvailablePort()
-	require.NoError(t, err)
-	t.Logf("Using port: %d for ED25519 key auth", availablePort)
-
-	pool, err := dockertest.NewPool("")
-	require.NoError(t, err)
-	err = pool.Client.Ping()
-	require.NoError(t, err)
-
-	keyPath := "/tmp/id_ed25519_without_passphrase.pub"
-	err = os.WriteFile(keyPath, []byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICKxrRIHEUPFjUuzjU5mKB9D0ZX5oKyzhVsxYysufGN0 miyanaga@m4pro.local"), 0644)
-	require.NoError(t, err)
-	defer os.Remove(keyPath)
-
-	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository:   "atmoz/sftp",
-		Tag:          "latest",
-		Cmd:          []string{fmt.Sprintf("%s::1001", username)},
-		ExposedPorts: []string{"22/tcp"},
-		PortBindings: map[docker.Port][]docker.PortBinding{
-			"22/tcp": {{HostIP: "0.0.0.0", HostPort: strconv.Itoa(availablePort)}},
-		},
-		Mounts: []string{fmt.Sprintf("%s:/home/%s/.ssh/keys/id_ed25519.pub:ro", keyPath, username)},
-	}, func(config *docker.HostConfig) {
-		config.AutoRemove = true
-		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
-	})
-	require.NoError(t, err)
-	defer func() {
-		if err := pool.Purge(resource); err != nil {
-			log.Printf("Could not purge resource: %s", err)
+func cleanupPublicKeyMounts(mounts []string) {
+	for _, mount := range mounts {
+		parts := strings.Split(mount, ":")
+		if len(parts) > 0 {
+			os.Remove(parts[0])
 		}
-	}()
-
-	hostPort := strconv.Itoa(availablePort)
-	pool.MaxWait = 120 * time.Second
-
-	privateKeyPath := "keys/id_ed25519_without_passphrase"
-	err = pool.Retry(func() error {
-		client := NewSFTPClientWithPrivateKey("localhost", hostPort, username, privateKeyPath)
-		return client.Connect()
-	})
-	require.NoError(t, err)
-
-	_, err = resource.Exec([]string{"mkdir", "-p", "/home/testuser/upload"}, dockertest.ExecOptions{})
-	require.NoError(t, err)
-	_, err = resource.Exec([]string{"chown", "testuser:users", "/home/testuser/upload"}, dockertest.ExecOptions{})
-	require.NoError(t, err)
-
-	tempFile := createTempTestFileWithName(t, "ed25519-key-auth-test.txt")
-	defer os.Remove(tempFile)
-
-	sftpClient := NewSFTPClientWithPrivateKey("localhost", hostPort, username, privateKeyPath)
-	err = sftpClient.Connect()
-	require.NoError(t, err)
-	defer sftpClient.Close()
-
-	remoteFilePath := "upload/ed25519-key-auth-test.txt"
-	err = sftpClient.Upload(tempFile, remoteFilePath)
-	assert.NoError(t, err)
-
-	verifyFileUpload(t, resource, remoteFilePath)
-}
-
-func testSFTPED25519KeyWithPassphraseAuth(t *testing.T) {
-	availablePort, err := findAvailablePort()
-	require.NoError(t, err)
-	t.Logf("Using port: %d for ED25519 key with passphrase auth", availablePort)
-
-	pool, err := dockertest.NewPool("")
-	require.NoError(t, err)
-	err = pool.Client.Ping()
-	require.NoError(t, err)
-
-	keyPath := "/tmp/id_ed25519_with_passphrase.pub"
-	pubKeyContent, err := os.ReadFile("keys/id_ed25519_with_passphrase.pub")
-	require.NoError(t, err)
-	err = os.WriteFile(keyPath, pubKeyContent, 0644)
-	require.NoError(t, err)
-	defer os.Remove(keyPath)
-
-	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository:   "atmoz/sftp",
-		Tag:          "latest",
-		Cmd:          []string{fmt.Sprintf("%s::1001", username)},
-		ExposedPorts: []string{"22/tcp"},
-		PortBindings: map[docker.Port][]docker.PortBinding{
-			"22/tcp": {{HostIP: "0.0.0.0", HostPort: strconv.Itoa(availablePort)}},
-		},
-		Mounts: []string{fmt.Sprintf("%s:/home/%s/.ssh/keys/id_ed25519.pub:ro", keyPath, username)},
-	}, func(config *docker.HostConfig) {
-		config.AutoRemove = true
-		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
-	})
-	require.NoError(t, err)
-	defer func() {
-		if err := pool.Purge(resource); err != nil {
-			log.Printf("Could not purge resource: %s", err)
-		}
-	}()
-
-	hostPort := strconv.Itoa(availablePort)
-	pool.MaxWait = 120 * time.Second
-
-	privateKeyPath := "keys/id_ed25519_with_passphrase"
-	passphrase := "the-pass"
-	err = pool.Retry(func() error {
-		client := NewSFTPClientWithPrivateKeyAndPassphrase("localhost", hostPort, username, privateKeyPath, passphrase)
-		return client.Connect()
-	})
-	require.NoError(t, err)
-
-	_, err = resource.Exec([]string{"mkdir", "-p", "/home/testuser/upload"}, dockertest.ExecOptions{})
-	require.NoError(t, err)
-	_, err = resource.Exec([]string{"chown", "testuser:users", "/home/testuser/upload"}, dockertest.ExecOptions{})
-	require.NoError(t, err)
-
-	tempFile := createTempTestFileWithName(t, "ed25519-key-passphrase-auth-test.txt")
-	defer os.Remove(tempFile)
-
-	sftpClient := NewSFTPClientWithPrivateKeyAndPassphrase("localhost", hostPort, username, privateKeyPath, passphrase)
-	err = sftpClient.Connect()
-	require.NoError(t, err)
-	defer sftpClient.Close()
-
-	remoteFilePath := "upload/ed25519-key-passphrase-auth-test.txt"
-	err = sftpClient.Upload(tempFile, remoteFilePath)
-	assert.NoError(t, err)
-
-	verifyFileUpload(t, resource, remoteFilePath)
+	}
 }
