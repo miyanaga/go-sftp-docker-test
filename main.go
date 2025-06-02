@@ -9,30 +9,96 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+type AuthMethod int
+
+const (
+	AuthPassword AuthMethod = iota
+	AuthPrivateKey
+	AuthPrivateKeyWithPassphrase
+)
+
 type SFTPClient struct {
-	host     string
-	port     string
-	username string
-	password string
-	client   *sftp.Client
-	sshConn  *ssh.Client
+	host       string
+	port       string
+	username   string
+	password   string
+	privateKey string
+	passphrase string
+	authMethod AuthMethod
+	client     *sftp.Client
+	sshConn    *ssh.Client
 }
 
 func NewSFTPClient(host, port, username, password string) *SFTPClient {
 	return &SFTPClient{
-		host:     host,
-		port:     port,
-		username: username,
-		password: password,
+		host:       host,
+		port:       port,
+		username:   username,
+		password:   password,
+		authMethod: AuthPassword,
+	}
+}
+
+func NewSFTPClientWithPrivateKey(host, port, username, privateKeyPath string) *SFTPClient {
+	return &SFTPClient{
+		host:       host,
+		port:       port,
+		username:   username,
+		privateKey: privateKeyPath,
+		authMethod: AuthPrivateKey,
+	}
+}
+
+func NewSFTPClientWithPrivateKeyAndPassphrase(host, port, username, privateKeyPath, passphrase string) *SFTPClient {
+	return &SFTPClient{
+		host:       host,
+		port:       port,
+		username:   username,
+		privateKey: privateKeyPath,
+		passphrase: passphrase,
+		authMethod: AuthPrivateKeyWithPassphrase,
 	}
 }
 
 func (s *SFTPClient) Connect() error {
-	config := &ssh.ClientConfig{
-		User: s.username,
-		Auth: []ssh.AuthMethod{
+	var authMethods []ssh.AuthMethod
+
+	switch s.authMethod {
+	case AuthPassword:
+		authMethods = []ssh.AuthMethod{
 			ssh.Password(s.password),
-		},
+		}
+	case AuthPrivateKey:
+		key, err := os.ReadFile(s.privateKey)
+		if err != nil {
+			return fmt.Errorf("failed to read private key: %w", err)
+		}
+		signer, err := ssh.ParsePrivateKey(key)
+		if err != nil {
+			return fmt.Errorf("failed to parse private key: %w", err)
+		}
+		authMethods = []ssh.AuthMethod{
+			ssh.PublicKeys(signer),
+		}
+	case AuthPrivateKeyWithPassphrase:
+		key, err := os.ReadFile(s.privateKey)
+		if err != nil {
+			return fmt.Errorf("failed to read private key: %w", err)
+		}
+		signer, err := ssh.ParsePrivateKeyWithPassphrase(key, []byte(s.passphrase))
+		if err != nil {
+			return fmt.Errorf("failed to parse private key with passphrase: %w", err)
+		}
+		authMethods = []ssh.AuthMethod{
+			ssh.PublicKeys(signer),
+		}
+	default:
+		return fmt.Errorf("unsupported authentication method")
+	}
+
+	config := &ssh.ClientConfig{
+		User:            s.username,
+		Auth:            authMethods,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
